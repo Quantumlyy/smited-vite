@@ -54,16 +54,26 @@ export function smitedVite(options?: PluginOptions): Plugin {
   const debouncer = new Debouncer();
   const hmrState: HmrState = createHmrState();
   let buildStartedAt = 0;
-  let buildSuccessFired = false;
+  /** Set in writeBundle. Required for success firing in closeBundle. */
+  let wroteBundle = false;
+  /**
+   * Set when any error is seen during the current build — either
+   * `buildEnd(err)` (input phase) or the wrapped `logger.error` (any
+   * phase). Vite logs failures via `logger.error` before calling
+   * `bundle.close()` (which fires our `closeBundle`), so this flag is
+   * reliably true at success-decision time when the build ultimately
+   * exits non-zero.
+   */
+  let errorObserved = false;
   let command: 'build' | 'serve' = 'serve';
 
   /**
-   * Brief window to await the success trigger so the gRPC call has a
-   * chance to land before closeBundle aborts the h2c session. Tuned
-   * short enough to be invisible against a slow build, long enough for
-   * a unary call on a healthy local-network daemon.
+   * Brief window to await in-flight triggers before tearing down the
+   * h2c session. Tuned short enough to be invisible against a slow
+   * build, long enough for a healthy local-network unary call to
+   * complete.
    */
-  const SUCCESS_TRIGGER_DEADLINE_MS = 250;
+  const TRIGGER_DEADLINE_MS = 250;
 
   const safeRun = (label: string, fn: () => void): void => {
     try {
@@ -110,13 +120,17 @@ export function smitedVite(options?: PluginOptions): Plugin {
         debouncer,
         opts: resolved!,
         hmrState,
+        markErrorObserved: () => {
+          errorObserved = true;
+        },
       }));
     },
 
     buildStart() {
       if (resolved?.active !== true) return;
       buildStartedAt = Date.now();
-      buildSuccessFired = false;
+      wroteBundle = false;
+      errorObserved = false;
     },
 
     buildEnd(err) {
@@ -125,33 +139,28 @@ export function smitedVite(options?: PluginOptions): Plugin {
       // generateBundle and writeBundle are still ahead, and any of
       // them can fail. Firing success here means a later output-phase
       // failure would produce both a false success AND a compile-error
-      // sensation. Success is fired from writeBundle instead.
+      // sensation. Success is fired from closeBundle instead, gated on
+      // wroteBundle && !errorObserved.
       const r = resolved;
       const c = client;
       if (r?.active !== true || c === null) return;
       safeRun('buildEnd', () => {
         if (err !== undefined && err !== null) {
+          errorObserved = true;
           const message = typeof err.message === 'string' ? err.message : String(err);
           classifyAndFire(c, debouncer, r, message);
         }
       });
     },
 
-    async writeBundle() {
-      const r = resolved;
-      const c = client;
-      if (r?.active !== true || c === null) return;
-      if (buildSuccessFired) return;
-      buildSuccessFired = true;
-      const trigger = maybeFireBuildSuccess(c, debouncer, r, buildStartedAt, command);
-      if (trigger === null) return;
-      // Race the gRPC unary call against a short deadline so a slow
-      // daemon can't visibly slow the build, but a healthy one has
-      // time to ack before closeBundle tears down the h2c session.
-      await Promise.race([
-        trigger,
-        new Promise<void>((resolve) => setTimeout(resolve, SUCCESS_TRIGGER_DEADLINE_MS)),
-      ]);
+    writeBundle() {
+      // writeBundle runs once per output. We just record that at least
+      // one output wrote successfully — the success trigger itself
+      // doesn't fire here because Rollup may have more outputs after
+      // this one, and any of them could fail. closeBundle is the only
+      // hook that runs after the entire output phase.
+      if (resolved?.active !== true) return;
+      wroteBundle = true;
     },
 
     handleHotUpdate(ctx) {
@@ -160,9 +169,26 @@ export function smitedVite(options?: PluginOptions): Plugin {
       return undefined;
     },
 
-    closeBundle() {
-      if (resolved?.active !== true || client === null) return;
+    async closeBundle() {
+      const r = resolved;
       const c = client;
+      if (r?.active !== true || c === null) return;
+      // Fire build_success only when the entire output phase actually
+      // wrote (wroteBundle) and no error was observed (errorObserved).
+      // Vite logs failures via logger.error before bundle.close, so
+      // errorObserved is true at this point in the failed-build case.
+      if (wroteBundle && !errorObserved && command === 'build') {
+        safeRun('closeBundle:success', () => {
+          // void: the trigger gets tracked in client's in-flight set
+          // and we await it via flush() below.
+          void maybeFireBuildSuccess(c, debouncer, r, buildStartedAt, command);
+        });
+      }
+      // Wait briefly for any in-flight triggers (success here, plus
+      // the compile-error trigger from buildEnd(err) on failed builds)
+      // to land before aborting the h2c session. Without this, fire-
+      // and-forget triggers get cancelled.
+      await c.flush(TRIGGER_DEADLINE_MS);
       safeRun('closeBundle', () => c.close());
       client = null;
     },
@@ -183,6 +209,7 @@ function wrapLoggerError(
     debouncer: Debouncer;
     opts: ResolvedOptions;
     hmrState: HmrState;
+    markErrorObserved: () => void;
   },
 ): void {
   if (base[WRAPPED_MARKER] === true) return;
@@ -190,7 +217,10 @@ function wrapLoggerError(
   const original = base.error.bind(base);
   base.error = (msg: string, opts?: LogErrorOptions) => {
     try {
-      const { client, debouncer, opts: resolved, hmrState } = context();
+      const { client, debouncer, opts: resolved, hmrState, markErrorObserved } = context();
+      // Mark *before* dispatch so closeBundle gates correctly even if
+      // the dispatch itself throws (it shouldn't, but defensively).
+      markErrorObserved();
       const message = typeof msg === 'string' ? msg : String(msg);
       const handledAsHmr = maybeFireAsHmrError(client, debouncer, resolved, hmrState);
       if (!handledAsHmr) {

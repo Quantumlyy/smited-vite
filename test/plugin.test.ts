@@ -180,7 +180,7 @@ describe('smitedVite plugin lifecycle', () => {
     }
   });
 
-  test('long successful production build fires build_success in writeBundle', async () => {
+  test('long successful production build fires build_success in closeBundle', async () => {
     const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
     const resolved = fakeResolvedConfig('build');
     await activate(plugin, resolved);
@@ -188,29 +188,27 @@ describe('smitedVite plugin lifecycle', () => {
     (plugin.buildStart as () => unknown).call({});
     await new Promise((r) => setTimeout(r, 25));
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
-    // No trigger yet — buildEnd ran successfully but the output phase hasn't.
+    // writeBundle alone does not fire — Rollup may run more outputs after.
+    await (plugin.writeBundle as () => unknown).call({});
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(0);
 
-    // writeBundle is the actual signal that an output bundle was written
-    // successfully. Only now should the success trigger land.
-    await (plugin.writeBundle as () => unknown).call({});
+    // closeBundle is the only hook that runs after the entire output phase.
+    await (plugin.closeBundle as () => unknown).call({});
     await waitForServer(server, 1);
 
     expect(server.received[0]?.sensation).toEqual({
       case: 'sensationName',
       value: 'deploy_success',
     });
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
   });
 
   test('regression: build_success does NOT fire if writeBundle never runs (output phase failed)', async () => {
-    // Reproduces the bug where another plugin throwing in generateBundle
-    // would cause us to fire deploy_success before the output phase
-    // actually finished. After the fix, success only fires after a
-    // successful writeBundle — if it never runs, we stay silent.
+    // First reproduced bug: a plugin throwing in generateBundle would
+    // trigger deploy_success even though the build ultimately failed.
+    // After the fix, success only fires when wroteBundle is true at
+    // closeBundle time. If the output phase never reached writeBundle,
+    // wroteBundle stays false and we stay silent.
     const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
     const resolved = fakeResolvedConfig('build');
     await activate(plugin, resolved);
@@ -226,9 +224,46 @@ describe('smitedVite plugin lifecycle', () => {
     expect(server.received).toHaveLength(0);
   });
 
+  test('regression: build_success does NOT fire when an error has been logged via logger.error', async () => {
+    // Multi-output failure case: output 1 writes successfully, output 2's
+    // hook throws and Vite logs the failure via logger.error before
+    // closeBundle fires. The wrapped logger.error sets errorObserved=true,
+    // so closeBundle's success fire is gated off.
+    const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
+    const resolved = fakeResolvedConfig('build');
+    await activate(plugin, resolved);
+
+    (plugin.buildStart as () => unknown).call({});
+    await new Promise((r) => setTimeout(r, 25));
+    await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
+    await (plugin.writeBundle as () => unknown).call({}); // output 1 succeeded
+
+    // Output 2 fails: Vite catches and logs via logger.error
+    // (which is wrapped). This both fires a compile_error trigger AND
+    // sets errorObserved so success won't fire below.
+    (resolved.logger.error as (msg: string) => void)('Found 1 error in output');
+    await waitForServer(server, 1);
+
+    await (plugin.closeBundle as () => unknown).call({});
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(server.received).toHaveLength(1);
+    expect(server.received[0]?.sensation).toEqual({
+      case: 'sensationName',
+      value: 'compile_error_mild',
+    });
+    // Specifically, no deploy_success in the received list.
+    expect(
+      server.received.find(
+        (r) => r.sensation.case === 'sensationName' && r.sensation.value === 'deploy_success',
+      ),
+    ).toBeUndefined();
+  });
+
   test('build_success fires only once across multiple writeBundle calls', async () => {
     // SSR builds (and other multi-output configurations) call writeBundle
-    // once per output. Success should still fire exactly once per build.
+    // once per output. Success should still fire exactly once per build,
+    // since closeBundle runs once at the very end.
     const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
     const resolved = fakeResolvedConfig('build');
     await activate(plugin, resolved);
@@ -239,12 +274,29 @@ describe('smitedVite plugin lifecycle', () => {
     await (plugin.writeBundle as () => unknown).call({});
     await (plugin.writeBundle as () => unknown).call({});
     await (plugin.writeBundle as () => unknown).call({});
+    await (plugin.closeBundle as () => unknown).call({});
     await waitForServer(server, 1);
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(1);
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
+  });
+
+  test('regression: compile-error trigger from buildEnd lands even when closeBundle immediately follows', async () => {
+    // Failed-build sequence: buildEnd(err) fires the compile-error
+    // trigger fire-and-forget, then closeBundle aborts the h2c session.
+    // closeBundle must await any in-flight triggers before aborting,
+    // or the trigger gets cancelled before reaching the daemon.
+    const plugin = smitedVite();
+    const resolved = fakeResolvedConfig('build');
+    await activate(plugin, resolved);
+
+    await (plugin.buildEnd as (err?: Error) => unknown).call({}, new Error('TS broke'));
+    await (plugin.closeBundle as () => unknown).call({});
+
+    expect(server.received).toHaveLength(1);
+    expect(server.received[0]?.sensation).toEqual({
+      case: 'sensationName',
+      value: 'compile_error_mild',
+    });
   });
 
   test('quick successful build does not fire build_success', async () => {
@@ -255,12 +307,10 @@ describe('smitedVite plugin lifecycle', () => {
     (plugin.buildStart as () => unknown).call({});
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
     await (plugin.writeBundle as () => unknown).call({});
+    await (plugin.closeBundle as () => unknown).call({});
     // Give triggers a chance to fail to fire.
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(0);
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
   });
 
   test('debouncer suppresses repeat compile-error within window', async () => {

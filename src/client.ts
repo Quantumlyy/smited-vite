@@ -35,6 +35,13 @@ export class SmitedClient {
   readonly #backendId: string;
   readonly #client: Client<typeof SmitedService>;
   readonly #sessionManager: Http2SessionManager;
+  /**
+   * Tracks every in-flight trigger() promise. The plugin's closeBundle
+   * awaits {@link flush} before {@link close} so a fire-and-forget
+   * trigger from `buildEnd(err)` actually lands at the daemon instead
+   * of being cancelled by the h2c session abort.
+   */
+  readonly #inFlight = new Set<Promise<unknown>>();
 
   constructor(host: string, backendId: string, logger: TaggedLogger) {
     this.#logger = logger;
@@ -59,10 +66,25 @@ export class SmitedClient {
    * Returns `true` iff the daemon accepted the trigger; returns
    * `false` on transport error, on `accepted=false`, or on any other
    * failure path. Never throws.
+   *
+   * The returned promise is also tracked internally so {@link flush}
+   * can wait for it before the session is torn down — callers that
+   * use `void client.trigger(...)` (fire-and-forget) still get
+   * delivery guarantees through the closeBundle path.
    */
-  async trigger(
+  trigger(
     sensationName: string,
     options: { intensityScale?: number; clientTraceId?: string } = {},
+  ): Promise<boolean> {
+    const promise = this.#triggerImpl(sensationName, options);
+    this.#inFlight.add(promise);
+    void promise.finally(() => this.#inFlight.delete(promise));
+    return promise;
+  }
+
+  async #triggerImpl(
+    sensationName: string,
+    options: { intensityScale?: number; clientTraceId?: string },
   ): Promise<boolean> {
     try {
       const req = create(TriggerRequestSchema, {
@@ -87,6 +109,22 @@ export class SmitedClient {
       this.#logger.debug(`trigger transport error: ${describeError(err)}`);
       return false;
     }
+  }
+
+  /**
+   * Wait for any in-flight triggers to settle, capped at `deadlineMs`.
+   * Returns when either every in-flight promise has resolved/rejected
+   * or the deadline elapses, whichever comes first. Used by the
+   * plugin's closeBundle so failing builds don't drop the
+   * fire-and-forget compile-error trigger.
+   */
+  async flush(deadlineMs: number): Promise<void> {
+    if (this.#inFlight.size === 0) return;
+    const settled = Promise.allSettled([...this.#inFlight]);
+    await Promise.race([
+      settled,
+      new Promise<void>((resolve) => setTimeout(resolve, deadlineMs)),
+    ]);
   }
 
   /**
