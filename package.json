@@ -1,0 +1,69 @@
+{
+  "name": "@quantumly-labs/smited-vite",
+  "version": "0.1.0",
+  "description": "Vite plugin that fires haptic sensations on the smited daemon for build and HMR events.",
+  "license": "MIT",
+  "author": "Nejc Drobnič <nejc@nejc.dev>",
+  "homepage": "https://github.com/Quantumlyy/smited-vite",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Quantumlyy/smited-vite.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Quantumlyy/smited-vite/issues"
+  },
+  "keywords": [
+    "vite",
+    "vite-plugin",
+    "smited",
+    "haptics",
+    "owo",
+    "build",
+    "hmr"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "generate": "buf generate",
+    "prepublishOnly": "npm run generate && npm run build && npm test"
+  },
+  "peerDependencies": {
+    "vite": "^7.0.0 || ^8.0.0"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.12.0",
+    "@connectrpc/connect": "^2.1.1",
+    "@connectrpc/connect-node": "^2.1.1"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "^1.69.0",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.0",
+    "vite": "^8.0.11",
+    "vitest": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
