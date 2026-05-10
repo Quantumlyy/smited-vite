@@ -66,6 +66,15 @@ export function smitedVite(options?: PluginOptions): Plugin {
    */
   let errorObserved = false;
   let command: 'build' | 'serve' = 'serve';
+  /**
+   * `vite build --watch` reuses the same plugin instance across
+   * rebuilds: configResolved runs once, but buildStart/buildEnd/
+   * closeBundle fire per cycle. In watch mode we must not abort the
+   * h2c session in closeBundle or every cycle past the first dies.
+   * The session is torn down in closeWatcher instead, which Rollup
+   * fires when the watcher itself is closed.
+   */
+  let isWatchMode = false;
 
   /**
    * Brief window to await in-flight triggers before tearing down the
@@ -93,6 +102,12 @@ export function smitedVite(options?: PluginOptions): Plugin {
     configResolved(viteConfig) {
       if (resolved === undefined || !resolved.active) return;
       command = viteConfig.command;
+      // build.watch is a WatcherOptions object when --watch is in use,
+      // null otherwise. Cast through unknown because our Vite types
+      // are typed loosely in tests.
+      isWatchMode =
+        command === 'build' &&
+        (viteConfig as unknown as { build?: { watch?: unknown } }).build?.watch != null;
       const tagged = createTaggedLogger(viteConfig.logger);
       logger = tagged;
       tagged.info(
@@ -186,10 +201,26 @@ export function smitedVite(options?: PluginOptions): Plugin {
       }
       // Wait briefly for any in-flight triggers (success here, plus
       // the compile-error trigger from buildEnd(err) on failed builds)
-      // to land before aborting the h2c session. Without this, fire-
-      // and-forget triggers get cancelled.
+      // to land before continuing. Without this, fire-and-forget
+      // triggers get cancelled when we abort the session below.
       await c.flush(TRIGGER_DEADLINE_MS);
+      // In watch mode the same plugin instance services every cycle —
+      // closing the session here would silently kill all later cycles.
+      // The session is torn down in closeWatcher (or by the http2
+      // session manager's idle timeout) instead.
+      if (isWatchMode) return;
       safeRun('closeBundle', () => c.close());
+      client = null;
+    },
+
+    async closeWatcher() {
+      // Fires when Vite (Rollup) shuts down the watcher in
+      // `vite build --watch`. Tear down the session that closeBundle
+      // intentionally left alive across cycles.
+      const c = client;
+      if (c === null) return;
+      await c.flush(TRIGGER_DEADLINE_MS);
+      safeRun('closeWatcher', () => c.close());
       client = null;
     },
   };

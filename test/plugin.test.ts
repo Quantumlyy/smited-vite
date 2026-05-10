@@ -25,11 +25,15 @@ function silentLogger(): Logger {
   } as unknown as Logger;
 }
 
-function fakeResolvedConfig(command: 'build' | 'serve' = 'build'): ResolvedConfig {
+function fakeResolvedConfig(
+  command: 'build' | 'serve' = 'build',
+  opts: { watch?: boolean } = {},
+): ResolvedConfig {
   return {
     command,
     mode: 'production',
     logger: silentLogger(),
+    build: { watch: opts.watch === true ? {} : null },
   } as unknown as ResolvedConfig;
 }
 
@@ -278,6 +282,57 @@ describe('smitedVite plugin lifecycle', () => {
     await waitForServer(server, 1);
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(1);
+  });
+
+  test('regression: vite build --watch keeps firing triggers across cycles', async () => {
+    // vite build --watch reuses the same plugin instance: configResolved
+    // runs once, but buildStart/buildEnd/closeBundle fire per cycle. If
+    // closeBundle aborts/nulls the client, every cycle past the first
+    // sees a dead session (or null) and triggers stop landing.
+    const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
+    const resolved = fakeResolvedConfig('build', { watch: true });
+    await activate(plugin, resolved);
+
+    // Cycle 1
+    (plugin.buildStart as () => unknown).call({});
+    await new Promise((r) => setTimeout(r, 25));
+    await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
+    await (plugin.writeBundle as () => unknown).call({});
+    await (plugin.closeBundle as () => unknown).call({});
+    await waitForServer(server, 1);
+    expect(server.received[0]?.sensation).toEqual({
+      case: 'sensationName',
+      value: 'deploy_success',
+    });
+
+    // Cycle 2: buildStart resets per-cycle state, the live client
+    // should still be wired up, the trigger should land.
+    (plugin.buildStart as () => unknown).call({});
+    await new Promise((r) => setTimeout(r, 25));
+    await (plugin.buildEnd as (err?: Error) => unknown).call({}, new Error('Found 3 errors in 2 files.'));
+    await (plugin.closeBundle as () => unknown).call({});
+    await waitForServer(server, 2);
+    expect(server.received[1]?.sensation).toEqual({
+      case: 'sensationName',
+      value: 'compile_error_mild',
+    });
+
+    // Cycle 3: success again on a successful rebuild.
+    (plugin.buildStart as () => unknown).call({});
+    await new Promise((r) => setTimeout(r, 25));
+    await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
+    await (plugin.writeBundle as () => unknown).call({});
+    await (plugin.closeBundle as () => unknown).call({});
+    await waitForServer(server, 3);
+    expect(server.received[2]?.sensation).toEqual({
+      case: 'sensationName',
+      value: 'deploy_success',
+    });
+
+    // Tear down explicitly via closeWatcher (the watch-shutdown hook).
+    if (typeof plugin.closeWatcher === 'function') {
+      await (plugin.closeWatcher as () => unknown).call({});
+    }
   });
 
   test('regression: compile-error trigger from buildEnd lands even when closeBundle immediately follows', async () => {
