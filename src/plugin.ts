@@ -76,13 +76,18 @@ export function smitedVite(options?: PluginOptions): Plugin {
    */
   let isWatchMode = false;
   /**
-   * `process.beforeExit` listener registered by closeBundle for
-   * one-shot builds. Held in a Set so afterEach-style teardown can
-   * de-register it without leaking listeners across plugin instances.
-   * Closes the client and fires success only when beforeExit fires —
-   * Vite calls process.exit(1) on a failed build, which skips
-   * beforeExit, so this is the only event that means "the entire
-   * build truly succeeded" regardless of plugin closeBundle ordering.
+   * Reference to the `process.beforeExit` listener registered by
+   * closeBundle for one-shot builds. Held so we can pass the same
+   * function to `process.removeListener` from `noteBuildFailed` and
+   * the defensive cleanup in `buildStart`. At most one listener is
+   * installed per plugin instance — programmatic users get a fresh
+   * instance per `vite.build()` call, so a Set isn't needed.
+   *
+   * The handler closes the client and fires success only when
+   * beforeExit fires. Vite calls `process.exit(1)` on a failed build,
+   * which skips beforeExit, so reaching this listener means "the
+   * entire build truly succeeded" regardless of plugin closeBundle
+   * ordering.
    */
   let beforeExitListener: ((code: number) => void) | null = null;
 

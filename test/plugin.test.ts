@@ -102,6 +102,7 @@ async function waitForServer(server: FakeServer, expected: number, timeoutMs = 2
 describe('smitedVite plugin lifecycle', () => {
   let savedEnv: Record<string, string | undefined>;
   let server: FakeServer;
+  let baselineBeforeExitListeners: Array<(...args: unknown[]) => void>;
 
   beforeEach(async () => {
     savedEnv = {};
@@ -109,15 +110,28 @@ describe('smitedVite plugin lifecycle', () => {
       savedEnv[k] = process.env[k];
       delete process.env[k];
     }
+    // Snapshot any pre-existing beforeExit listeners (vitest, node) so
+    // afterEach can remove only the listeners installed during this
+    // test, not unrelated ones.
+    baselineBeforeExitListeners = process.listeners('beforeExit') as Array<
+      (...args: unknown[]) => void
+    >;
     server = await startFakeServer();
     process.env.SMITED_HOST = server.address;
   });
 
   afterEach(async () => {
     await server.stop();
-    // Tests install process.once('beforeExit', ...) handlers; clean them up
-    // so they don't leak across tests or fire spuriously when vitest exits.
-    process.removeAllListeners('beforeExit');
+    // Surgical cleanup: only remove beforeExit listeners that weren't
+    // there at the start of the test. Avoids stomping on vitest/node
+    // internals that may rely on their own beforeExit listeners.
+    for (const listener of process.listeners('beforeExit') as Array<
+      (...args: unknown[]) => void
+    >) {
+      if (!baselineBeforeExitListeners.includes(listener)) {
+        process.removeListener('beforeExit', listener);
+      }
+    }
     for (const k of ENV_VARS_TO_SCRUB) {
       const v = savedEnv[k];
       if (v === undefined) delete process.env[k];
