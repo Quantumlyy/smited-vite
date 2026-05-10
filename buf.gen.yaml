@@ -5,5 +5,6 @@ plugins:
     opt:
       - target=ts
       - import_extension=js
+    include_imports: true
 inputs:
   - module: buf.build/quantumly-labs/smited:v0.1.0
