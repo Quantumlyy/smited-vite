@@ -54,7 +54,16 @@ export function smitedVite(options?: PluginOptions): Plugin {
   const debouncer = new Debouncer();
   const hmrState: HmrState = createHmrState();
   let buildStartedAt = 0;
+  let buildSuccessFired = false;
   let command: 'build' | 'serve' = 'serve';
+
+  /**
+   * Brief window to await the success trigger so the gRPC call has a
+   * chance to land before closeBundle aborts the h2c session. Tuned
+   * short enough to be invisible against a slow build, long enough for
+   * a unary call on a healthy local-network daemon.
+   */
+  const SUCCESS_TRIGGER_DEADLINE_MS = 250;
 
   const safeRun = (label: string, fn: () => void): void => {
     try {
@@ -107,9 +116,16 @@ export function smitedVite(options?: PluginOptions): Plugin {
     buildStart() {
       if (resolved?.active !== true) return;
       buildStartedAt = Date.now();
+      buildSuccessFired = false;
     },
 
     buildEnd(err) {
+      // Note: deliberately does NOT fire build_success here. buildEnd
+      // runs at the end of the *input* phase — output hooks like
+      // generateBundle and writeBundle are still ahead, and any of
+      // them can fail. Firing success here means a later output-phase
+      // failure would produce both a false success AND a compile-error
+      // sensation. Success is fired from writeBundle instead.
       const r = resolved;
       const c = client;
       if (r?.active !== true || c === null) return;
@@ -117,10 +133,25 @@ export function smitedVite(options?: PluginOptions): Plugin {
         if (err !== undefined && err !== null) {
           const message = typeof err.message === 'string' ? err.message : String(err);
           classifyAndFire(c, debouncer, r, message);
-        } else {
-          maybeFireBuildSuccess(c, debouncer, r, buildStartedAt, command);
         }
       });
+    },
+
+    async writeBundle() {
+      const r = resolved;
+      const c = client;
+      if (r?.active !== true || c === null) return;
+      if (buildSuccessFired) return;
+      buildSuccessFired = true;
+      const trigger = maybeFireBuildSuccess(c, debouncer, r, buildStartedAt, command);
+      if (trigger === null) return;
+      // Race the gRPC unary call against a short deadline so a slow
+      // daemon can't visibly slow the build, but a healthy one has
+      // time to ack before closeBundle tears down the h2c session.
+      await Promise.race([
+        trigger,
+        new Promise<void>((resolve) => setTimeout(resolve, SUCCESS_TRIGGER_DEADLINE_MS)),
+      ]);
     },
 
     handleHotUpdate(ctx) {
