@@ -47,6 +47,29 @@ function fakeHmrContext(file = '/proj/src/foo.ts'): HmrContext {
   };
 }
 
+/**
+ * Plugin hooks like `closeBundle` and `writeBundle` use Vite's object
+ * form (`{ order, handler }`) for explicit ordering. Tests need the
+ * underlying handler to invoke directly with `.call({})`.
+ */
+function getCloseBundleHandler(plugin: ReturnType<typeof smitedVite>): (...args: unknown[]) => unknown {
+  const cb = plugin.closeBundle;
+  if (typeof cb === 'function') return cb as (...args: unknown[]) => unknown;
+  if (cb && typeof cb === 'object' && typeof cb.handler === 'function') {
+    return cb.handler as (...args: unknown[]) => unknown;
+  }
+  throw new Error('plugin.closeBundle is not a function or hook object');
+}
+
+function getWriteBundleHandler(plugin: ReturnType<typeof smitedVite>): (...args: unknown[]) => unknown {
+  const wb = plugin.writeBundle;
+  if (typeof wb === 'function') return wb as (...args: unknown[]) => unknown;
+  if (wb && typeof wb === 'object' && typeof wb.handler === 'function') {
+    return wb.handler as (...args: unknown[]) => unknown;
+  }
+  throw new Error('plugin.writeBundle is not a function or hook object');
+}
+
 async function activate(plugin: ReturnType<typeof smitedVite>, resolved: ResolvedConfig) {
   const env: { command: 'build' | 'serve'; mode: string } = {
     command: resolved.command,
@@ -92,6 +115,9 @@ describe('smitedVite plugin lifecycle', () => {
 
   afterEach(async () => {
     await server.stop();
+    // Tests install process.once('beforeExit', ...) handlers; clean them up
+    // so they don't leak across tests or fire spuriously when vitest exits.
+    process.removeAllListeners('beforeExit');
     for (const k of ENV_VARS_TO_SCRUB) {
       const v = savedEnv[k];
       if (v === undefined) delete process.env[k];
@@ -106,9 +132,7 @@ describe('smitedVite plugin lifecycle', () => {
     expect(resolved.logger.info).toHaveBeenCalledWith(
       expect.stringContaining('[smited-vite] active'),
     );
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
+    await getCloseBundleHandler(plugin).call({});
   });
 
   test('buildEnd with a generic error fires compile_error_mild', async () => {
@@ -123,9 +147,7 @@ describe('smitedVite plugin lifecycle', () => {
       case: 'sensationName',
       value: 'compile_error_mild',
     });
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
+    await getCloseBundleHandler(plugin).call({});
   });
 
   test('buildEnd with "Found 7 errors" fires the severe sensation', async () => {
@@ -140,9 +162,7 @@ describe('smitedVite plugin lifecycle', () => {
       case: 'sensationName',
       value: 'compile_error_severe',
     });
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
+    await getCloseBundleHandler(plugin).call({});
   });
 
   test('handleHotUpdate followed by logger.error fires hmrError, not compile', async () => {
@@ -162,9 +182,7 @@ describe('smitedVite plugin lifecycle', () => {
       case: 'sensationName',
       value: 'hmr_zap',
     });
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
+    await getCloseBundleHandler(plugin).call({});
   });
 
   test('logger.error without a recent hot-update fires the compile sensation', async () => {
@@ -179,12 +197,10 @@ describe('smitedVite plugin lifecycle', () => {
       case: 'sensationName',
       value: 'compile_error_mild',
     });
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
+    await getCloseBundleHandler(plugin).call({});
   });
 
-  test('long successful production build fires build_success in closeBundle', async () => {
+  test('long successful production build fires build_success on process beforeExit', async () => {
     const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
     const resolved = fakeResolvedConfig('build');
     await activate(plugin, resolved);
@@ -192,13 +208,17 @@ describe('smitedVite plugin lifecycle', () => {
     (plugin.buildStart as () => unknown).call({});
     await new Promise((r) => setTimeout(r, 25));
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
-    // writeBundle alone does not fire — Rollup may run more outputs after.
-    await (plugin.writeBundle as () => unknown).call({});
+    await getWriteBundleHandler(plugin).call({});
+    // closeBundle returns without firing — closeBundle hooks run in
+    // parallel in Rollup, so we must defer past the entire bundle.close.
+    await getCloseBundleHandler(plugin).call({});
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(0);
 
-    // closeBundle is the only hook that runs after the entire output phase.
-    await (plugin.closeBundle as () => unknown).call({});
+    // process.beforeExit is the actual success boundary: Vite calls
+    // process.exit(1) on failure, so beforeExit only fires on a clean
+    // exit regardless of plugin closeBundle ordering.
+    process.emit('beforeExit', 0);
     await waitForServer(server, 1);
 
     expect(server.received[0]?.sensation).toEqual({
@@ -221,9 +241,7 @@ describe('smitedVite plugin lifecycle', () => {
     await new Promise((r) => setTimeout(r, 25));
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
     // Skip writeBundle — simulates generateBundle / writeBundle failure.
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
+    await getCloseBundleHandler(plugin).call({});
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(0);
   });
@@ -232,7 +250,7 @@ describe('smitedVite plugin lifecycle', () => {
     // Multi-output failure case: output 1 writes successfully, output 2's
     // hook throws and Vite logs the failure via logger.error before
     // closeBundle fires. The wrapped logger.error sets errorObserved=true,
-    // so closeBundle's success fire is gated off.
+    // so the beforeExit handler's success fire is gated off.
     const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
     const resolved = fakeResolvedConfig('build');
     await activate(plugin, resolved);
@@ -240,34 +258,38 @@ describe('smitedVite plugin lifecycle', () => {
     (plugin.buildStart as () => unknown).call({});
     await new Promise((r) => setTimeout(r, 25));
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
-    await (plugin.writeBundle as () => unknown).call({}); // output 1 succeeded
+    await getWriteBundleHandler(plugin).call({}); // output 1 succeeded
 
     // Output 2 fails: Vite catches and logs via logger.error
     // (which is wrapped). This both fires a compile_error trigger AND
-    // sets errorObserved so success won't fire below.
+    // sets errorObserved so success won't fire on beforeExit.
     (resolved.logger.error as (msg: string) => void)('Found 1 error in output');
     await waitForServer(server, 1);
 
-    await (plugin.closeBundle as () => unknown).call({});
-    await new Promise((r) => setTimeout(r, 50));
+    await getCloseBundleHandler(plugin).call({});
+    process.emit('beforeExit', 0);
+    await new Promise((r) => setTimeout(r, 100));
 
     expect(server.received).toHaveLength(1);
     expect(server.received[0]?.sensation).toEqual({
       case: 'sensationName',
       value: 'compile_error_mild',
     });
-    // Specifically, no deploy_success in the received list.
-    expect(
-      server.received.find(
-        (r) => r.sensation.case === 'sensationName' && r.sensation.value === 'deploy_success',
-      ),
-    ).toBeUndefined();
   });
 
-  test('build_success fires only once across multiple writeBundle calls', async () => {
-    // SSR builds (and other multi-output configurations) call writeBundle
-    // once per output. Success should still fire exactly once per build,
-    // since closeBundle runs once at the very end.
+  test('regression: build_success does NOT fire if a later closeBundle plugin throws after ours', async () => {
+    // closeBundle hooks run in PARALLEL in Rollup — being ordered last
+    // doesn't help, because parallel siblings may still be running when
+    // our hook returns. The fix is to defer success past Vite's process
+    // exit decision: Vite calls process.exit(1) on a failed build (which
+    // skips beforeExit), and lets the process exit naturally on success
+    // (which fires beforeExit). So beforeExit is the actual success
+    // boundary.
+    //
+    // This test simulates the failure path: our closeBundle returns,
+    // then Vite logs the later plugin's failure via logger.error, then
+    // our beforeExit handler runs and (correctly) skips success because
+    // errorObserved is now true.
     const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
     const resolved = fakeResolvedConfig('build');
     await activate(plugin, resolved);
@@ -275,10 +297,39 @@ describe('smitedVite plugin lifecycle', () => {
     (plugin.buildStart as () => unknown).call({});
     await new Promise((r) => setTimeout(r, 25));
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
-    await (plugin.writeBundle as () => unknown).call({});
-    await (plugin.writeBundle as () => unknown).call({});
-    await (plugin.writeBundle as () => unknown).call({});
-    await (plugin.closeBundle as () => unknown).call({});
+    await getWriteBundleHandler(plugin).call({});
+    await getCloseBundleHandler(plugin).call({});
+
+    // Later plugin's closeBundle throws → Vite logs it AFTER bundle.close.
+    (resolved.logger.error as (msg: string) => void)(
+      'Plugin foo: Error in closeBundle',
+    );
+    await waitForServer(server, 1); // compile_error_mild fires
+
+    // Now Vite would normally process.exit(1), which skips beforeExit
+    // entirely. We simulate that the right way by simply NOT emitting
+    // beforeExit here — and verifying nothing else fires.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(server.received).toHaveLength(1);
+    expect(server.received[0]?.sensation.value).toBe('compile_error_mild');
+  });
+
+  test('build_success fires only once across multiple writeBundle calls', async () => {
+    // SSR builds (and other multi-output configurations) call writeBundle
+    // once per output. Success should still fire exactly once per build,
+    // since closeBundle runs once and beforeExit fires once.
+    const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
+    const resolved = fakeResolvedConfig('build');
+    await activate(plugin, resolved);
+
+    (plugin.buildStart as () => unknown).call({});
+    await new Promise((r) => setTimeout(r, 25));
+    await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
+    await getWriteBundleHandler(plugin).call({});
+    await getWriteBundleHandler(plugin).call({});
+    await getWriteBundleHandler(plugin).call({});
+    await getCloseBundleHandler(plugin).call({});
+    process.emit('beforeExit', 0);
     await waitForServer(server, 1);
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(1);
@@ -297,8 +348,8 @@ describe('smitedVite plugin lifecycle', () => {
     (plugin.buildStart as () => unknown).call({});
     await new Promise((r) => setTimeout(r, 25));
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
-    await (plugin.writeBundle as () => unknown).call({});
-    await (plugin.closeBundle as () => unknown).call({});
+    await getWriteBundleHandler(plugin).call({});
+    await getCloseBundleHandler(plugin).call({});
     await waitForServer(server, 1);
     expect(server.received[0]?.sensation).toEqual({
       case: 'sensationName',
@@ -310,7 +361,7 @@ describe('smitedVite plugin lifecycle', () => {
     (plugin.buildStart as () => unknown).call({});
     await new Promise((r) => setTimeout(r, 25));
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, new Error('Found 3 errors in 2 files.'));
-    await (plugin.closeBundle as () => unknown).call({});
+    await getCloseBundleHandler(plugin).call({});
     await waitForServer(server, 2);
     expect(server.received[1]?.sensation).toEqual({
       case: 'sensationName',
@@ -321,8 +372,8 @@ describe('smitedVite plugin lifecycle', () => {
     (plugin.buildStart as () => unknown).call({});
     await new Promise((r) => setTimeout(r, 25));
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
-    await (plugin.writeBundle as () => unknown).call({});
-    await (plugin.closeBundle as () => unknown).call({});
+    await getWriteBundleHandler(plugin).call({});
+    await getCloseBundleHandler(plugin).call({});
     await waitForServer(server, 3);
     expect(server.received[2]?.sensation).toEqual({
       case: 'sensationName',
@@ -345,7 +396,7 @@ describe('smitedVite plugin lifecycle', () => {
     await activate(plugin, resolved);
 
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, new Error('TS broke'));
-    await (plugin.closeBundle as () => unknown).call({});
+    await getCloseBundleHandler(plugin).call({});
 
     expect(server.received).toHaveLength(1);
     expect(server.received[0]?.sensation).toEqual({
@@ -361,8 +412,9 @@ describe('smitedVite plugin lifecycle', () => {
 
     (plugin.buildStart as () => unknown).call({});
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
-    await (plugin.writeBundle as () => unknown).call({});
-    await (plugin.closeBundle as () => unknown).call({});
+    await getWriteBundleHandler(plugin).call({});
+    await getCloseBundleHandler(plugin).call({});
+    process.emit('beforeExit', 0);
     // Give triggers a chance to fail to fire.
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(0);
@@ -378,9 +430,7 @@ describe('smitedVite plugin lifecycle', () => {
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, new Error('boom 2'));
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(1);
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
+    await getCloseBundleHandler(plugin).call({});
   });
 
   test('null sensation in options skips that event class', async () => {
@@ -393,8 +443,6 @@ describe('smitedVite plugin lifecycle', () => {
     await (plugin.buildEnd as (err?: Error) => unknown).call({}, new Error('boom'));
     await new Promise((r) => setTimeout(r, 50));
     expect(server.received).toHaveLength(0);
-    if (typeof plugin.closeBundle === 'function') {
-      await (plugin.closeBundle as () => unknown).call({});
-    }
+    await getCloseBundleHandler(plugin).call({});
   });
 });

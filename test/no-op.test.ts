@@ -69,6 +69,17 @@ function fakeHmrContext(file = '/tmp/foo.ts'): HmrContext {
   };
 }
 
+function getCloseBundleHandler(
+  plugin: ReturnType<typeof smitedVite>,
+): (...args: unknown[]) => unknown {
+  const cb = plugin.closeBundle;
+  if (typeof cb === 'function') return cb as (...args: unknown[]) => unknown;
+  if (cb && typeof cb === 'object' && typeof cb.handler === 'function') {
+    return cb.handler as (...args: unknown[]) => unknown;
+  }
+  throw new Error('plugin.closeBundle is not a function or hook object');
+}
+
 async function driveAll(
   plugin: ReturnType<typeof smitedVite>,
   resolved: ResolvedConfig,
@@ -83,7 +94,7 @@ async function driveAll(
   await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
   await (plugin.buildEnd as (err?: Error) => unknown).call({}, new Error('boom'));
   await (plugin.handleHotUpdate as (ctx: HmrContext) => unknown)(fakeHmrContext());
-  await (plugin.closeBundle as () => unknown).call({});
+  await getCloseBundleHandler(plugin).call({});
 }
 
 function expectInert(

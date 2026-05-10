@@ -75,6 +75,16 @@ export function smitedVite(options?: PluginOptions): Plugin {
    * fires when the watcher itself is closed.
    */
   let isWatchMode = false;
+  /**
+   * `process.beforeExit` listener registered by closeBundle for
+   * one-shot builds. Held in a Set so afterEach-style teardown can
+   * de-register it without leaking listeners across plugin instances.
+   * Closes the client and fires success only when beforeExit fires —
+   * Vite calls process.exit(1) on a failed build, which skips
+   * beforeExit, so this is the only event that means "the entire
+   * build truly succeeded" regardless of plugin closeBundle ordering.
+   */
+  let beforeExitListener: ((code: number) => void) | null = null;
 
   /**
    * Brief window to await in-flight triggers before tearing down the
@@ -94,6 +104,12 @@ export function smitedVite(options?: PluginOptions): Plugin {
 
   return {
     name: 'smited-vite',
+    // Run in Vite's 'post' plugin group so we're invoked after most
+    // user / framework plugins for closeBundle ordering. Combined with
+    // `closeBundle.order: 'post'` below this puts our hook as late as
+    // Vite/Rollup ordering can guarantee — but closeBundle is parallel,
+    // so we still defer success past beforeExit for the strong fix.
+    enforce: 'post',
 
     config() {
       resolved = resolveOptions(options);
@@ -184,33 +200,44 @@ export function smitedVite(options?: PluginOptions): Plugin {
       return undefined;
     },
 
-    async closeBundle() {
-      const r = resolved;
-      const c = client;
-      if (r?.active !== true || c === null) return;
-      // Fire build_success only when the entire output phase actually
-      // wrote (wroteBundle) and no error was observed (errorObserved).
-      // Vite logs failures via logger.error before bundle.close, so
-      // errorObserved is true at this point in the failed-build case.
-      if (wroteBundle && !errorObserved && command === 'build') {
-        safeRun('closeBundle:success', () => {
-          // void: the trigger gets tracked in client's in-flight set
-          // and we await it via flush() below.
-          void maybeFireBuildSuccess(c, debouncer, r, buildStartedAt, command);
-        });
-      }
-      // Wait briefly for any in-flight triggers (success here, plus
-      // the compile-error trigger from buildEnd(err) on failed builds)
-      // to land before continuing. Without this, fire-and-forget
-      // triggers get cancelled when we abort the session below.
-      await c.flush(TRIGGER_DEADLINE_MS);
-      // In watch mode the same plugin instance services every cycle —
-      // closing the session here would silently kill all later cycles.
-      // The session is torn down in closeWatcher (or by the http2
-      // session manager's idle timeout) instead.
-      if (isWatchMode) return;
-      safeRun('closeBundle', () => c.close());
-      client = null;
+    closeBundle: {
+      // `order: 'post'` plus the plugin-level `enforce: 'post'` puts us
+      // last among closeBundle hooks, but Rollup invokes closeBundle in
+      // PARALLEL — being last in invocation order doesn't wait for
+      // earlier siblings to finish their async work. The only reliable
+      // success boundary is `process.beforeExit`, which fires only
+      // when Vite did not call `process.exit(1)` on failure.
+      order: 'post',
+      async handler() {
+        const r = resolved;
+        const c = client;
+        if (r?.active !== true || c === null) return;
+        // Flush in-flight triggers (compile-error from buildEnd(err))
+        // before anything else might cancel them.
+        await c.flush(TRIGGER_DEADLINE_MS);
+        // In watch mode, the same plugin instance services every cycle.
+        // We can't use beforeExit (it only fires once per process), so
+        // we defer one tick via setImmediate and check errorObserved.
+        // This is best-effort: a parallel closeBundle that throws AFTER
+        // setImmediate fires can still produce a false success.
+        // Documented limitation; one-shot builds get the strong fix.
+        if (isWatchMode) {
+          if (wroteBundle && command === 'build') {
+            scheduleWatchSuccessCheck(c, r);
+          }
+          return;
+        }
+        // One-shot build. Defer success past the rest of bundle.close()
+        // and Vite's error handling by listening for beforeExit.
+        if (wroteBundle && command === 'build') {
+          installBeforeExitFire(c, r);
+          return;
+        }
+        // No success path needed (dev mode, or wroteBundle never set).
+        // Close immediately.
+        safeRun('closeBundle', () => c.close());
+        client = null;
+      },
     },
 
     async closeWatcher() {
@@ -224,6 +251,60 @@ export function smitedVite(options?: PluginOptions): Plugin {
       client = null;
     },
   };
+
+  function scheduleWatchSuccessCheck(c: SmitedClient, r: ResolvedOptions): void {
+    setImmediate(() => {
+      // errorObserved may have become true between our closeBundle
+      // returning and this microtask running (e.g., a parallel
+      // closeBundle threw and Vite logged it via logger.error).
+      if (errorObserved) return;
+      const live = client;
+      if (live !== c || live === null) return;
+      void maybeFireBuildSuccess(live, debouncer, r, buildStartedAt, command);
+    });
+  }
+
+  function installBeforeExitFire(c: SmitedClient, r: ResolvedOptions): void {
+    if (beforeExitListener !== null) return;
+    const handler = (): void => {
+      beforeExitListener = null;
+      try {
+        if (errorObserved) {
+          c.close();
+          if (client === c) client = null;
+          return;
+        }
+        const trigger = maybeFireBuildSuccess(
+          c,
+          debouncer,
+          r,
+          buildStartedAt,
+          command,
+        );
+        if (trigger === null) {
+          c.close();
+          if (client === c) client = null;
+          return;
+        }
+        // Schedule trigger + a deadline timer. Both keep the event
+        // loop alive; whichever wins lets us close cleanly. beforeExit
+        // may be re-emitted after this work completes, but our handler
+        // is already removed via the once() registration.
+        void Promise.race([
+          trigger,
+          new Promise<void>((resolve) => setTimeout(resolve, TRIGGER_DEADLINE_MS)),
+        ]).finally(() => {
+          c.close();
+          if (client === c) client = null;
+        });
+      } catch {
+        // Defensive: a beforeExit listener throwing would leave the
+        // process in an awkward state. Swallow and let Vite exit.
+      }
+    };
+    beforeExitListener = handler;
+    process.once('beforeExit', handler);
+  }
 }
 
 /**
