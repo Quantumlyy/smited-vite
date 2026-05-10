@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.vitest-cache
+.turbo
+.tsbuildinfo
+*.tsbuildinfo
+
+# Per-example artefacts
+examples/*/dist/
+examples/*/node_modules/
