@@ -277,6 +277,87 @@ describe('smitedVite plugin lifecycle', () => {
     });
   });
 
+  test('regression: beforeExit handler is removed when errorObserved transitions true', async () => {
+    // Programmatic vite.build() users: our closeBundle installs a
+    // beforeExit handler. If the wrapped logger.error fires later
+    // (Vite logging a closeBundle plugin failure), errorObserved
+    // becomes true. We must actively de-register the listener so the
+    // host process draining naturally — long after the failure — can't
+    // fire deploy_success.
+    const before = process.listenerCount('beforeExit');
+    const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
+    const resolved = fakeResolvedConfig('build');
+    await activate(plugin, resolved);
+
+    (plugin.buildStart as () => unknown).call({});
+    await new Promise((r) => setTimeout(r, 25));
+    await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
+    await getWriteBundleHandler(plugin).call({});
+    await getCloseBundleHandler(plugin).call({});
+    expect(process.listenerCount('beforeExit')).toBe(before + 1);
+
+    (resolved.logger.error as (msg: string) => void)('plugin foo: closeBundle threw');
+    await waitForServer(server, 1); // compile_error
+
+    // The handler must be gone now, not still queued.
+    expect(process.listenerCount('beforeExit')).toBe(before);
+
+    // Even if the host's process drain fires beforeExit later, no
+    // success should land.
+    process.emit('beforeExit', 0);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(server.received).toHaveLength(1);
+    expect(server.received[0]?.sensation.value).toBe('compile_error_mild');
+  });
+
+  test('regression: buildStart removes a stale beforeExit handler from a previous run', async () => {
+    // Defensive: if a plugin instance is somehow reused for a second
+    // build (or buildStart fires unexpectedly), the previous run's
+    // beforeExit handler must be removed so it doesn't fire on the
+    // wrong client / state later.
+    const before = process.listenerCount('beforeExit');
+    const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
+    const resolved = fakeResolvedConfig('build');
+    await activate(plugin, resolved);
+
+    (plugin.buildStart as () => unknown).call({});
+    await new Promise((r) => setTimeout(r, 25));
+    await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
+    await getWriteBundleHandler(plugin).call({});
+    await getCloseBundleHandler(plugin).call({});
+    expect(process.listenerCount('beforeExit')).toBe(before + 1);
+
+    // A second buildStart on the same instance should clear the stale
+    // handler from the first run.
+    (plugin.buildStart as () => unknown).call({});
+    expect(process.listenerCount('beforeExit')).toBe(before);
+  });
+
+  test('regression: handler skips success when host has set process.exitCode != 0', async () => {
+    // A programmatic host that catches a Vite rejection may set
+    // process.exitCode = 1 without going through the wrapped logger.
+    // The handler treats a non-zero exitCode as a failure signal.
+    const plugin = smitedVite({ buildSuccessMinDurationMs: 10 });
+    const resolved = fakeResolvedConfig('build');
+    await activate(plugin, resolved);
+
+    (plugin.buildStart as () => unknown).call({});
+    await new Promise((r) => setTimeout(r, 25));
+    await (plugin.buildEnd as (err?: Error) => unknown).call({}, undefined);
+    await getWriteBundleHandler(plugin).call({});
+    await getCloseBundleHandler(plugin).call({});
+
+    const previousExitCode = process.exitCode;
+    process.exitCode = 1;
+    try {
+      process.emit('beforeExit', 1);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(server.received).toHaveLength(0);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+  });
+
   test('regression: build_success does NOT fire if a later closeBundle plugin throws after ours', async () => {
     // closeBundle hooks run in PARALLEL in Rollup — being ordered last
     // doesn't help, because parallel siblings may still be running when

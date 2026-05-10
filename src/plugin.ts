@@ -102,6 +102,30 @@ export function smitedVite(options?: PluginOptions): Plugin {
     }
   };
 
+  /**
+   * De-register the pending beforeExit handler if any. Safe to call
+   * even when no handler is installed. Used by every code path that
+   * learns the build won't (or shouldn't) fire success — `errorObserved`
+   * transitions, a fresh `buildStart`, and the handler's own teardown.
+   */
+  const removeBeforeExitListener = (): void => {
+    if (beforeExitListener === null) return;
+    process.removeListener('beforeExit', beforeExitListener);
+    beforeExitListener = null;
+  };
+
+  /**
+   * Mark the current build as failed and discard the pending success
+   * fire. The wrapped `logger.error` and `buildEnd(err)` both call
+   * this so a programmatic `vite.build()` host that catches a rejection
+   * doesn't get a stale `deploy_success` haptic when the host process
+   * later drains naturally.
+   */
+  const noteBuildFailed = (): void => {
+    errorObserved = true;
+    removeBeforeExitListener();
+  };
+
   return {
     name: 'smited-vite',
     // Run in Vite's 'post' plugin group so we're invoked after most
@@ -151,14 +175,18 @@ export function smitedVite(options?: PluginOptions): Plugin {
         debouncer,
         opts: resolved!,
         hmrState,
-        markErrorObserved: () => {
-          errorObserved = true;
-        },
+        markErrorObserved: noteBuildFailed,
       }));
     },
 
     buildStart() {
       if (resolved?.active !== true) return;
+      // Defensive: clear a beforeExit handler from any previous run on
+      // this plugin instance. In the normal CLI lifecycle there is at
+      // most one build per instance, but programmatic users (or a
+      // future Vite that reuses plugins) shouldn't get a stale handler
+      // from a previous cycle firing on a fresh build's state.
+      removeBeforeExitListener();
       buildStartedAt = Date.now();
       wroteBundle = false;
       errorObserved = false;
@@ -177,7 +205,7 @@ export function smitedVite(options?: PluginOptions): Plugin {
       if (r?.active !== true || c === null) return;
       safeRun('buildEnd', () => {
         if (err !== undefined && err !== null) {
-          errorObserved = true;
+          noteBuildFailed();
           const message = typeof err.message === 'string' ? err.message : String(err);
           classifyAndFire(c, debouncer, r, message);
         }
@@ -269,7 +297,17 @@ export function smitedVite(options?: PluginOptions): Plugin {
     const handler = (): void => {
       beforeExitListener = null;
       try {
-        if (errorObserved) {
+        // Two failure signals to gate against:
+        //  - errorObserved: set by wrapped logger.error / buildEnd(err)
+        //  - process.exitCode != 0: a host (programmatic Vite caller)
+        //    has indicated the process is exiting non-zero, even if
+        //    the failure didn't go through Vite's wrapped logger.
+        // The latter doesn't catch every silent failure (a host that
+        // catches and ignores will leave exitCode untouched), but it
+        // bounds the surface area for the documented limitation.
+        const hostFailed =
+          typeof process.exitCode === 'number' && process.exitCode !== 0;
+        if (errorObserved || hostFailed) {
           c.close();
           if (client === c) client = null;
           return;
