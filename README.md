@@ -38,12 +38,25 @@ export default defineConfig({
 ```
 
 ```sh
-# only the developer with hardware sets this:
+# Only the developer with hardware sets these. SMITED_HOST tells the
+# plugin where the daemon lives; SMITED_BACKEND_ID tells it which
+# backend to route triggers to:
 export SMITED_HOST=windows-rig.local:7777
+export SMITED_BACKEND_ID=owo-1   # whatever id your hardware backend registered as
 ```
 
-That's it. Run `vite build` or `vite dev`; if `SMITED_HOST` is set
-and a smited daemon is reachable, errors fire sensations.
+> **Why `SMITED_BACKEND_ID` matters.** The default backend id is
+> `mock-owo` — the always-present mock backend that accepts triggers
+> but produces no haptic output. This is intentional: it makes the
+> plugin safe against accidental misconfiguration. **If you want to
+> actually feel anything, you must point at a real backend** by
+> setting `SMITED_BACKEND_ID` (or passing `backendId` in plugin
+> options). Run `grpcurl -plaintext "$SMITED_HOST" smited.v1.SmitedService/ListBackends`
+> to see the registered ids on your daemon.
+
+That's it. Run `vite build` or `vite dev`; if `SMITED_HOST` is set,
+the daemon is reachable, and `SMITED_BACKEND_ID` points at a real
+backend, errors fire sensations.
 
 ## Configuration
 
@@ -54,7 +67,10 @@ smitedVite({
   // Daemon host:port. Defaults to SMITED_HOST env var. Absence = no-op.
   host: 'windows-rig.local:7777',
 
-  // Backend id to target. Defaults to "mock-owo".
+  // Backend id to target. Default "mock-owo" is the always-present
+  // mock backend — accepts triggers, produces no haptic output. Point
+  // this at your real hardware backend (or set SMITED_BACKEND_ID) to
+  // actually feel anything.
   backendId: 'mock-owo',
 
   // Sensation library names. Set to null to disable a specific event class.
@@ -87,7 +103,7 @@ Per-developer overrides — no need to edit `vite.config.ts`:
 | Variable | Purpose | Default |
 |---|---|---|
 | `SMITED_HOST` | Daemon `host:port`. **Absent = no-op.** | _(unset)_ |
-| `SMITED_BACKEND_ID` | Target backend id | `mock-owo` |
+| `SMITED_BACKEND_ID` | Target backend id. **Default `mock-owo` produces no haptic output** — set this to your real hardware backend's id to actually feel anything. | `mock-owo` |
 | `SMITED_DISABLE` | Set to `1` to force-disable | _(unset)_ |
 | `SMITED_SENSATION_COMPILE_ERROR` | Override compile-error sensation | `compile_error_mild` |
 | `SMITED_SENSATION_COMPILE_ERROR_SEVERE` | Override severe sensation | `compile_error_severe` |
@@ -127,6 +143,17 @@ options.
 ```sh
 grpcurl -plaintext "$SMITED_HOST" list
 # expect: smited.v1.SmitedService
+```
+
+**No haptic feedback even though the plugin says active?** You're
+probably routed at the mock backend (the default). Check which
+backend you're targeting — the active log line includes it
+(`backend=mock-owo` is the give-away) — and override with
+`SMITED_BACKEND_ID` pointing at your real hardware backend. List
+the daemon's registered backends with:
+
+```sh
+grpcurl -plaintext "$SMITED_HOST" smited.v1.SmitedService/ListBackends
 ```
 
 **Disable temporarily without editing config.**

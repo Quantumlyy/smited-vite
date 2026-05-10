@@ -20,8 +20,10 @@ export interface PluginOptions {
    * Backend id to target. Defaults to `"mock-owo"` for safety — the
    * mock backend is always present on a running daemon, and pointing
    * at it accidentally on a hardware-equipped daemon does nothing
-   * scary. Override per-developer via the `SMITED_BACKEND_ID`
-   * environment variable.
+   * scary. **The mock backend accepts triggers but produces no haptic
+   * output**, so you must override this (here or via the
+   * `SMITED_BACKEND_ID` environment variable) to point at your real
+   * hardware backend if you actually want to feel anything.
    */
   backendId?: string;
 
